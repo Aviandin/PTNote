@@ -1,0 +1,15 @@
+{
+    "id": "note_1",
+    "title": "Untitled Note",
+    "text": "",
+    "color": "#fff7a8",
+    "pinned": true,
+    "position": [
+        100,
+        100
+    ],
+    "size": [
+        420,
+        300
+    ]
+}
