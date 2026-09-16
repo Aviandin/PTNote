@@ -8,3 +8,6 @@ Configure the settings<div/>
 or Exit the app.<div/>
 <div/>
 Please check out my <a href="https://www.youtube.com/@aviandin">youtube channel!</a>
+<div>
+Also please make some plugins for the app for better content in whatever you want in it!
+</div>
