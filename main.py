@@ -3,7 +3,7 @@ import json
 import importlib.util
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QPoint, QSize, Signal
+from PySide6.QtCore import Qt, QPoint, QSize, Signal, QEvent
 from PySide6.QtGui import QAction, QIcon, QFont, QColor
 from PySide6.QtWidgets import (
     QApplication,
@@ -186,6 +186,14 @@ class NoteWindow(QWidget):
 
         self.dragging = False
         self.drag_offset = QPoint()
+                # Custom resizing for the borderless window.
+        self.resizing = False
+        self.resize_edges = Qt.Edges()
+        self.resize_start_pos = QPoint()
+        self.resize_start_geometry = self.geometry()
+
+        # Track mouse movement over the note and its children.
+        self.setMouseTracking(True)
 
         self.setWindowTitle(title or "Untitled Note")
         self.setWindowIcon(icon(APP_ICON))
@@ -554,6 +562,22 @@ class NoteWindow(QWidget):
         )
 
         self.header = header
+                # Enable mouse tracking on the widgets inside the
+        # borderless note so resizing works even though there
+        # is no native window frame.
+        for widget in (
+            self,
+            self.header,
+            self.close_button,
+            self.color_button,
+            self.pin_button,
+            self.title_edit,
+            self.editor,
+        ):
+            widget.setMouseTracking(True)
+            widget.installEventFilter(self)
+
+        self.installEventFilter(self)
 
     # ========================================================
     # COLOR
@@ -835,6 +859,281 @@ class NoteWindow(QWidget):
         self.raise_()
 
         self.activateWindow()
+
+            # ========================================================
+    # CUSTOM BORDERLESS RESIZING
+    # ========================================================
+
+    RESIZE_MARGIN = 8
+
+    def get_resize_edges(self, global_pos):
+
+        rect = self.frameGeometry()
+
+        x = global_pos.x()
+        y = global_pos.y()
+
+        edges = Qt.Edges()
+
+        if abs(x - rect.left()) <= self.RESIZE_MARGIN:
+            edges |= Qt.Edge.LeftEdge
+
+        if abs(x - rect.right()) <= self.RESIZE_MARGIN:
+            edges |= Qt.Edge.RightEdge
+
+        if abs(y - rect.top()) <= self.RESIZE_MARGIN:
+            edges |= Qt.Edge.TopEdge
+
+        if abs(y - rect.bottom()) <= self.RESIZE_MARGIN:
+            edges |= Qt.Edge.BottomEdge
+
+        return edges
+
+    def resize_cursor(self, edges):
+
+        left = bool(edges & Qt.Edge.LeftEdge)
+        right = bool(edges & Qt.Edge.RightEdge)
+        top = bool(edges & Qt.Edge.TopEdge)
+        bottom = bool(edges & Qt.Edge.BottomEdge)
+
+        if (left and top) or (right and bottom):
+            return Qt.CursorShape.SizeFDiagCursor
+
+        if (right and top) or (left and bottom):
+            return Qt.CursorShape.SizeBDiagCursor
+
+        if left or right:
+            return Qt.CursorShape.SizeHorCursor
+
+        if top or bottom:
+            return Qt.CursorShape.SizeVerCursor
+
+        return Qt.CursorShape.ArrowCursor
+
+    def update_resize_cursor(self, global_pos):
+
+        if self.resizing:
+            return
+
+        edges = self.get_resize_edges(global_pos)
+
+        self.setCursor(
+            self.resize_cursor(edges)
+        )
+
+    def perform_resize(self, global_pos):
+
+        if not self.resizing:
+            return
+
+        start = self.resize_start_pos
+        geometry = self.resize_start_geometry
+
+        dx = global_pos.x() - start.x()
+        dy = global_pos.y() - start.y()
+
+        left = bool(
+            self.resize_edges
+            & Qt.Edge.LeftEdge
+        )
+
+        right = bool(
+            self.resize_edges
+            & Qt.Edge.RightEdge
+        )
+
+        top = bool(
+            self.resize_edges
+            & Qt.Edge.TopEdge
+        )
+
+        bottom = bool(
+            self.resize_edges
+            & Qt.Edge.BottomEdge
+        )
+
+        new_left = geometry.left()
+        new_top = geometry.top()
+        new_right = geometry.right()
+        new_bottom = geometry.bottom()
+
+        # ----------------------------------------------------
+        # Horizontal resizing
+        # ----------------------------------------------------
+
+        if left:
+
+            new_left = geometry.left() + dx
+
+            if (
+                new_right - new_left + 1
+                < self.minimumWidth()
+            ):
+
+                new_left = (
+                    new_right
+                    - self.minimumWidth()
+                    + 1
+                )
+
+        elif right:
+
+            new_right = geometry.right() + dx
+
+            if (
+                new_right - new_left + 1
+                < self.minimumWidth()
+            ):
+
+                new_right = (
+                    new_left
+                    + self.minimumWidth()
+                    - 1
+                )
+
+        # ----------------------------------------------------
+        # Vertical resizing
+        # ----------------------------------------------------
+
+        if top:
+
+            new_top = geometry.top() + dy
+
+            if (
+                new_bottom - new_top + 1
+                < self.minimumHeight()
+            ):
+
+                new_top = (
+                    new_bottom
+                    - self.minimumHeight()
+                    + 1
+                )
+
+        elif bottom:
+
+            new_bottom = geometry.bottom() + dy
+
+            if (
+                new_bottom - new_top + 1
+                < self.minimumHeight()
+            ):
+
+                new_bottom = (
+                    new_top
+                    + self.minimumHeight()
+                    - 1
+                )
+
+        self.setGeometry(
+            new_left,
+            new_top,
+            new_right - new_left + 1,
+            new_bottom - new_top + 1
+        )
+
+    def eventFilter(self, watched, event):
+
+        event_type = event.type()
+
+        # ----------------------------------------------------
+        # Mouse press
+        # ----------------------------------------------------
+
+        if event_type == QEvent.Type.MouseButtonPress:
+
+            if (
+                event.button()
+                == Qt.MouseButton.LeftButton
+            ):
+
+                global_pos = (
+                    event.globalPosition()
+                    .toPoint()
+                )
+
+                edges = self.get_resize_edges(
+                    global_pos
+                )
+
+                if edges:
+
+                    self.resizing = True
+                    self.resize_edges = edges
+
+                    self.resize_start_pos = (
+                        global_pos
+                    )
+
+                    self.resize_start_geometry = (
+                        self.geometry()
+                    )
+
+                    self.setCursor(
+                        self.resize_cursor(edges)
+                    )
+
+                    return True
+
+        # ----------------------------------------------------
+        # Mouse move
+        # ----------------------------------------------------
+
+        elif event_type == QEvent.Type.MouseMove:
+
+            global_pos = (
+                event.globalPosition()
+                .toPoint()
+            )
+
+            if self.resizing:
+
+                self.perform_resize(
+                    global_pos
+                )
+
+                return True
+
+            self.update_resize_cursor(
+                global_pos
+            )
+
+        # ----------------------------------------------------
+        # Mouse release
+        # ----------------------------------------------------
+
+        elif event_type == QEvent.Type.MouseButtonRelease:
+
+            if (
+                event.button()
+                == Qt.MouseButton.LeftButton
+            ):
+
+                if self.resizing:
+
+                    self.resizing = False
+                    self.resize_edges = (
+                        Qt.Edges()
+                    )
+
+                    self.setCursor(
+                        Qt.CursorShape.ArrowCursor
+                    )
+
+                    # Save the new dimensions.
+                    if self.app.settings.get(
+                        "auto_save",
+                        True
+                    ):
+
+                        self.save_note()
+
+                    return True
+
+        return super().eventFilter(
+            watched,
+            event
+        )
 
     # ========================================================
     # DRAGGING
