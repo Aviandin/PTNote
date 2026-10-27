@@ -1,7 +1,7 @@
 {
     "id": "note_1",
     "title": "Untitled Note",
-    "text": "",
+    "text": "Fish",
     "color": "#fff7a8",
     "pinned": true,
     "position": [
@@ -9,7 +9,7 @@
         35
     ],
     "size": [
-        656,
+        302,
         365
     ]
 }

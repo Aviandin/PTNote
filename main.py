@@ -1,5 +1,7 @@
 import sys
+import os
 import json
+import shutil
 import importlib.util
 from pathlib import Path
 
@@ -30,18 +32,55 @@ from PySide6.QtWidgets import (
 # PATHS
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent
+# PyInstaller --onefile extracts bundled resources into a temporary folder.
+# Never store user data there: that folder disappears when PTNote exits.
+FROZEN = bool(getattr(sys, "frozen", False))
+BASE_DIR = (
+    Path(sys.executable).resolve().parent
+    if FROZEN
+    else Path(__file__).resolve().parent
+)
+BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", BASE_DIR))
 
-ASSETS_DIR = BASE_DIR / "assets"
+# Assets may be read from PyInstaller's resource bundle, but all editable
+# user data is stored beside PTNote.exe (or main.py in development mode).
+ASSETS_DIR = BUNDLE_DIR / "assets"
 DATA_DIR = BASE_DIR / "data"
 NOTES_DIR = DATA_DIR / "notes"
 PLUGINS_DIR = BASE_DIR / "plugins"
-
 SETTINGS_FILE = DATA_DIR / "settings.json"
 
-DATA_DIR.mkdir(exist_ok=True)
-NOTES_DIR.mkdir(exist_ok=True)
-PLUGINS_DIR.mkdir(exist_ok=True)
+# Seed permanent user folders from bundled files without ever overwriting
+# files the user already has. This also handles an existing but empty data
+# folder beside the EXE.
+BUNDLED_DATA_DIR = BUNDLE_DIR / "data"
+BUNDLED_PLUGINS_DIR = BUNDLE_DIR / "plugins"
+
+
+def copy_missing_files(source_dir, destination_dir):
+    """Copy bundled files only when the corresponding user file is absent."""
+    if not source_dir.exists() or not source_dir.is_dir():
+        return
+    for source in source_dir.rglob("*"):
+        if not source.is_file():
+            continue
+        relative = source.relative_to(source_dir)
+        destination = destination_dir / relative
+        if destination.exists():
+            continue
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+        except Exception as exc:
+            print(f"[PTNote] Could not copy {source.name}: {exc}")
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+NOTES_DIR.mkdir(parents=True, exist_ok=True)
+PLUGINS_DIR.mkdir(parents=True, exist_ok=True)
+
+if FROZEN:
+    copy_missing_files(BUNDLED_DATA_DIR, DATA_DIR)
+    copy_missing_files(BUNDLED_PLUGINS_DIR, PLUGINS_DIR)
 
 
 # ============================================================
@@ -73,6 +112,7 @@ DEFAULT_SETTINGS = {
     "remember_size": True,
     "default_text_size": 16,
     "enabled_plugins": [],
+    "start_with_windows": False,
 }
 
 
@@ -95,9 +135,41 @@ def load_settings():
         return DEFAULT_SETTINGS.copy()
 
 
+def set_windows_startup(enabled):
+    """Enable or disable PTNote in the current Windows user's startup apps."""
+    if sys.platform != "win32":
+        return
+
+    try:
+        import winreg
+
+        run_key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        app_name = "PTNote"
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            run_key_path,
+            0,
+            winreg.KEY_SET_VALUE,
+        ) as key:
+            if enabled:
+                if getattr(sys, "frozen", False):
+                    command = f'"{sys.executable}"'
+                else:
+                    command = f'"{sys.executable}" "{Path(__file__).resolve()}"'
+                winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, command)
+            else:
+                try:
+                    winreg.DeleteValue(key, app_name)
+                except FileNotFoundError:
+                    pass
+    except Exception as e:
+        print(f"[PTNote] Could not update Windows startup: {e}")
+
+
 def save_settings(settings):
     try:
-        DATA_DIR.mkdir(exist_ok=True)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
 
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(settings, f, indent=4)
@@ -186,14 +258,13 @@ class NoteWindow(QWidget):
 
         self.dragging = False
         self.drag_offset = QPoint()
-                # Custom resizing for the borderless window.
+
+        # Borderless resize state.
+        self.resize_margin = 8
         self.resizing = False
-        self.resize_edges = Qt.Edges()
+        self.resize_edges = set()
         self.resize_start_pos = QPoint()
         self.resize_start_geometry = self.geometry()
-
-        # Track mouse movement over the note and its children.
-        self.setMouseTracking(True)
 
         self.setWindowTitle(title or "Untitled Note")
         self.setWindowIcon(icon(APP_ICON))
@@ -354,6 +425,12 @@ class NoteWindow(QWidget):
         )
 
         self.loading = False
+
+        # A QApplication-level filter catches edge events even when the
+        # pointer is over the editor, title field, or a toolbar child.
+        qt_app = QApplication.instance()
+        if qt_app is not None:
+            qt_app.installEventFilter(self)
 
     # ========================================================
     # UI
@@ -562,22 +639,6 @@ class NoteWindow(QWidget):
         )
 
         self.header = header
-                # Enable mouse tracking on the widgets inside the
-        # borderless note so resizing works even though there
-        # is no native window frame.
-        for widget in (
-            self,
-            self.header,
-            self.close_button,
-            self.color_button,
-            self.pin_button,
-            self.title_edit,
-            self.editor,
-        ):
-            widget.setMouseTracking(True)
-            widget.installEventFilter(self)
-
-        self.installEventFilter(self)
 
     # ========================================================
     # COLOR
@@ -827,6 +888,13 @@ class NoteWindow(QWidget):
 
     def closeEvent(self, event):
 
+        qt_app = QApplication.instance()
+        if qt_app is not None:
+            try:
+                qt_app.removeEventFilter(self)
+            except Exception:
+                pass
+
         # Save before closing.
         self.save_note()
 
@@ -860,353 +928,163 @@ class NoteWindow(QWidget):
 
         self.activateWindow()
 
-            # ========================================================
-    # CUSTOM BORDERLESS RESIZING
+    # ========================================================
+    # BORDERLESS RESIZING + DRAGGING
     # ========================================================
 
-    RESIZE_MARGIN = 8
+    def _is_note_widget(self, watched):
+        if watched is self:
+            return True
+        return isinstance(watched, QWidget) and self.isAncestorOf(watched)
 
-    def get_resize_edges(self, global_pos):
-
+    def _resize_edges_at(self, global_pos):
         rect = self.frameGeometry()
+        margin = self.resize_margin
+        edges = set()
 
-        x = global_pos.x()
-        y = global_pos.y()
+        if global_pos.x() <= rect.left() + margin:
+            edges.add("left")
+        elif global_pos.x() >= rect.right() - margin:
+            edges.add("right")
 
-        edges = Qt.Edges()
-
-        if abs(x - rect.left()) <= self.RESIZE_MARGIN:
-            edges |= Qt.Edge.LeftEdge
-
-        if abs(x - rect.right()) <= self.RESIZE_MARGIN:
-            edges |= Qt.Edge.RightEdge
-
-        if abs(y - rect.top()) <= self.RESIZE_MARGIN:
-            edges |= Qt.Edge.TopEdge
-
-        if abs(y - rect.bottom()) <= self.RESIZE_MARGIN:
-            edges |= Qt.Edge.BottomEdge
+        if global_pos.y() <= rect.top() + margin:
+            edges.add("top")
+        elif global_pos.y() >= rect.bottom() - margin:
+            edges.add("bottom")
 
         return edges
 
-    def resize_cursor(self, edges):
-
-        left = bool(edges & Qt.Edge.LeftEdge)
-        right = bool(edges & Qt.Edge.RightEdge)
-        top = bool(edges & Qt.Edge.TopEdge)
-        bottom = bool(edges & Qt.Edge.BottomEdge)
-
-        if (left and top) or (right and bottom):
+    @staticmethod
+    def _cursor_for_edges(edges):
+        if edges in ({"left", "top"}, {"right", "bottom"}):
             return Qt.CursorShape.SizeFDiagCursor
-
-        if (right and top) or (left and bottom):
+        if edges in ({"right", "top"}, {"left", "bottom"}):
             return Qt.CursorShape.SizeBDiagCursor
-
-        if left or right:
+        if edges in ({"left"}, {"right"}):
             return Qt.CursorShape.SizeHorCursor
-
-        if top or bottom:
+        if edges in ({"top"}, {"bottom"}):
             return Qt.CursorShape.SizeVerCursor
-
         return Qt.CursorShape.ArrowCursor
 
-    def update_resize_cursor(self, global_pos):
+    @staticmethod
+    def _mouse_global_position(event):
+        """Return a mouse event's global position across Qt 6 builds."""
+        try:
+            return event.globalPosition().toPoint()
+        except (AttributeError, RuntimeError, TypeError):
+            try:
+                return event.globalPos()
+            except (AttributeError, RuntimeError, TypeError):
+                return QPoint()
 
-        if self.resizing:
-            return
+    def _perform_resize(self, global_pos):
+        start = self.resize_start_geometry
+        delta = global_pos - self.resize_start_pos
 
-        edges = self.get_resize_edges(global_pos)
+        x = start.x()
+        y = start.y()
+        width = start.width()
+        height = start.height()
+        min_width = self.minimumWidth()
+        min_height = self.minimumHeight()
 
-        self.setCursor(
-            self.resize_cursor(edges)
-        )
+        if "left" in self.resize_edges:
+            width = start.width() - delta.x()
+            if width < min_width:
+                width = min_width
+                x = start.right() - width + 1
+            else:
+                x = start.x() + delta.x()
+        elif "right" in self.resize_edges:
+            width = max(min_width, start.width() + delta.x())
 
-    def perform_resize(self, global_pos):
+        if "top" in self.resize_edges:
+            height = start.height() - delta.y()
+            if height < min_height:
+                height = min_height
+                y = start.bottom() - height + 1
+            else:
+                y = start.y() + delta.y()
+        elif "bottom" in self.resize_edges:
+            height = max(min_height, start.height() + delta.y())
 
-        if not self.resizing:
-            return
-
-        start = self.resize_start_pos
-        geometry = self.resize_start_geometry
-
-        dx = global_pos.x() - start.x()
-        dy = global_pos.y() - start.y()
-
-        left = bool(
-            self.resize_edges
-            & Qt.Edge.LeftEdge
-        )
-
-        right = bool(
-            self.resize_edges
-            & Qt.Edge.RightEdge
-        )
-
-        top = bool(
-            self.resize_edges
-            & Qt.Edge.TopEdge
-        )
-
-        bottom = bool(
-            self.resize_edges
-            & Qt.Edge.BottomEdge
-        )
-
-        new_left = geometry.left()
-        new_top = geometry.top()
-        new_right = geometry.right()
-        new_bottom = geometry.bottom()
-
-        # ----------------------------------------------------
-        # Horizontal resizing
-        # ----------------------------------------------------
-
-        if left:
-
-            new_left = geometry.left() + dx
-
-            if (
-                new_right - new_left + 1
-                < self.minimumWidth()
-            ):
-
-                new_left = (
-                    new_right
-                    - self.minimumWidth()
-                    + 1
-                )
-
-        elif right:
-
-            new_right = geometry.right() + dx
-
-            if (
-                new_right - new_left + 1
-                < self.minimumWidth()
-            ):
-
-                new_right = (
-                    new_left
-                    + self.minimumWidth()
-                    - 1
-                )
-
-        # ----------------------------------------------------
-        # Vertical resizing
-        # ----------------------------------------------------
-
-        if top:
-
-            new_top = geometry.top() + dy
-
-            if (
-                new_bottom - new_top + 1
-                < self.minimumHeight()
-            ):
-
-                new_top = (
-                    new_bottom
-                    - self.minimumHeight()
-                    + 1
-                )
-
-        elif bottom:
-
-            new_bottom = geometry.bottom() + dy
-
-            if (
-                new_bottom - new_top + 1
-                < self.minimumHeight()
-            ):
-
-                new_bottom = (
-                    new_top
-                    + self.minimumHeight()
-                    - 1
-                )
-
-        self.setGeometry(
-            new_left,
-            new_top,
-            new_right - new_left + 1,
-            new_bottom - new_top + 1
-        )
+        self.setGeometry(x, y, width, height)
 
     def eventFilter(self, watched, event):
-
         event_type = event.type()
 
-        # ----------------------------------------------------
-        # Mouse press
-        # ----------------------------------------------------
-
-        if event_type == QEvent.Type.MouseButtonPress:
-
-            if (
-                event.button()
-                == Qt.MouseButton.LeftButton
-            ):
-
-                global_pos = (
-                    event.globalPosition()
-                    .toPoint()
-                )
-
-                edges = self.get_resize_edges(
-                    global_pos
-                )
-
-                if edges:
-
-                    self.resizing = True
-                    self.resize_edges = edges
-
-                    self.resize_start_pos = (
-                        global_pos
-                    )
-
-                    self.resize_start_geometry = (
-                        self.geometry()
-                    )
-
-                    self.setCursor(
-                        self.resize_cursor(edges)
-                    )
-
-                    return True
-
-        # ----------------------------------------------------
-        # Mouse move
-        # ----------------------------------------------------
-
-        elif event_type == QEvent.Type.MouseMove:
-
-            global_pos = (
-                event.globalPosition()
-                .toPoint()
-            )
-
-            if self.resizing:
-
-                self.perform_resize(
-                    global_pos
-                )
-
+        # While a resize is active, keep handling movement/release even if
+        # the cursor temporarily moves beyond the note's original rectangle.
+        if self.resizing:
+            if event_type == QEvent.Type.MouseMove:
+                self._perform_resize(self._mouse_global_position(event))
+                return True
+            if event_type == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+                self._perform_resize(self._mouse_global_position(event))
+                self.resizing = False
+                self.resize_edges = set()
+                if self.app.settings.get("remember_size", True) or self.app.settings.get("remember_position", True):
+                    self.save_note()
                 return True
 
-            self.update_resize_cursor(
-                global_pos
-            )
+        if not self._is_note_widget(watched):
+            return super().eventFilter(watched, event)
 
-        # ----------------------------------------------------
-        # Mouse release
-        # ----------------------------------------------------
+        if event_type == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+            global_pos = self._mouse_global_position(event)
+            edges = self._resize_edges_at(global_pos)
+            if edges:
+                self.resizing = True
+                self.resize_edges = edges
+                self.resize_start_pos = global_pos
+                self.resize_start_geometry = self.frameGeometry()
+                return True
 
-        elif event_type == QEvent.Type.MouseButtonRelease:
+        elif event_type == QEvent.Type.MouseMove and not self.resizing:
+            global_pos = self._mouse_global_position(event)
+            edges = self._resize_edges_at(global_pos)
+            cursor = self._cursor_for_edges(edges)
+            if isinstance(watched, QWidget):
+                if edges:
+                    watched.setCursor(cursor)
+                else:
+                    current = watched.cursor().shape()
+                    resize_cursors = {
+                        Qt.CursorShape.SizeFDiagCursor,
+                        Qt.CursorShape.SizeBDiagCursor,
+                        Qt.CursorShape.SizeHorCursor,
+                        Qt.CursorShape.SizeVerCursor,
+                    }
+                    if current in resize_cursors:
+                        watched.unsetCursor()
 
-            if (
-                event.button()
-                == Qt.MouseButton.LeftButton
-            ):
-
-                if self.resizing:
-
-                    self.resizing = False
-                    self.resize_edges = (
-                        Qt.Edges()
-                    )
-
-                    self.setCursor(
-                        Qt.CursorShape.ArrowCursor
-                    )
-
-                    # Save the new dimensions.
-                    if self.app.settings.get(
-                        "auto_save",
-                        True
-                    ):
-
-                        self.save_note()
-
-                    return True
-
-        return super().eventFilter(
-            watched,
-            event
-        )
-
-    # ========================================================
-    # DRAGGING
-    # ========================================================
+        return super().eventFilter(watched, event)
 
     def mousePressEvent(self, event):
-
-        if (
-            event.button()
-            == Qt.MouseButton.LeftButton
-        ):
-
-            # Only drag from the custom header.
+        if event.button() == Qt.MouseButton.LeftButton:
+            # Drag from the blank area of the custom header.
             if event.position().y() <= 42:
-
                 self.dragging = True
-
                 self.drag_offset = (
-                    event.globalPosition()
-                    .toPoint()
-                    - self.frameGeometry()
-                    .topLeft()
+                    event.globalPosition().toPoint()
+                    - self.frameGeometry().topLeft()
                 )
-
                 event.accept()
-
                 return
-
-        super().mousePressEvent(
-            event
-        )
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-
-        if (
-            self.dragging
-            and event.buttons()
-            & Qt.MouseButton.LeftButton
-        ):
-
-            self.move(
-                event.globalPosition()
-                .toPoint()
-                - self.drag_offset
-            )
-
+        if self.dragging and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self.drag_offset)
             return
-
-        super().mouseMoveEvent(
-            event
-        )
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-
-        if (
-            event.button()
-            == Qt.MouseButton.LeftButton
-        ):
-
-            if self.dragging:
-
-                self.dragging = False
-
-                if self.app.settings.get(
-                    "auto_save",
-                    True
-                ):
-
-                    self.save_note()
-
-        super().mouseReleaseEvent(
-            event
-        )
+        if event.button() == Qt.MouseButton.LeftButton and self.dragging:
+            self.dragging = False
+            if self.app.settings.get("auto_save", True):
+                self.save_note()
+        super().mouseReleaseEvent(event)
 
 
 # ============================================================
@@ -1385,6 +1263,25 @@ class SettingsWindow(QDialog):
         )
 
         # ----------------------------------------------------
+        # Start with Windows
+        # ----------------------------------------------------
+
+        self.start_with_windows = QCheckBox(
+            "Start PTNote with Windows"
+        )
+
+        self.start_with_windows.setChecked(
+            self.app.settings.get(
+                "start_with_windows",
+                False
+            )
+        )
+
+        layout.addWidget(
+            self.start_with_windows
+        )
+
+        # ----------------------------------------------------
         # Plugins
         # ----------------------------------------------------
 
@@ -1495,6 +1392,14 @@ class SettingsWindow(QDialog):
         self.app.settings[
             "default_text_size"
         ] = self.text_size.value()
+
+        self.app.settings[
+            "start_with_windows"
+        ] = self.start_with_windows.isChecked()
+
+        set_windows_startup(
+            self.app.settings["start_with_windows"]
+        )
 
         save_settings(
             self.app.settings
